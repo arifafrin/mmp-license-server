@@ -1,0 +1,16 @@
+# Render Blueprint - auto-config for the Micro Meta Pro license server.
+# (Optional: you can also set everything by hand in the Render dashboard.)
+services:
+  - type: web
+    name: mmp-license
+    runtime: python
+    plan: free
+    buildCommand: "echo no build needed"
+    startCommand: "python server.py"
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
