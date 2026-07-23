@@ -196,8 +196,9 @@ def api_trial(email, device, ip):
 
 # -- Gmail verification + trial daily limit ----------------------------------
 
-GMAIL_USER = os.environ.get("GMAIL_USER", "")
-GMAIL_PASS = os.environ.get("GMAIL_APP_PASSWORD", "")
+GMAIL_USER = os.environ.get("GMAIL_USER", "").strip().strip('"').strip("'")
+# App passwords are shown by Google with spaces ("abcd efgh ijkl mnop") — remove them
+GMAIL_PASS = os.environ.get("GMAIL_APP_PASSWORD", "").strip().strip('"').strip("'").replace(" ", "")
 TRIAL_DAILY_LIMIT = int(os.environ.get("TRIAL_DAILY_LIMIT", "50"))
 CODE_TTL_MIN = 15
 
@@ -210,9 +211,19 @@ def _send_gmail(to_email, code):
     msg["Subject"] = "Micro Meta Pro - Verification Code: " + code
     msg["From"] = GMAIL_USER
     msg["To"] = to_email
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as s:
-        s.login(GMAIL_USER, GMAIL_PASS)
-        s.sendmail(GMAIL_USER, [to_email], msg.as_string())
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as s:
+            s.login(GMAIL_USER, GMAIL_PASS)
+            s.sendmail(GMAIL_USER, [to_email], msg.as_string())
+    except smtplib.SMTPAuthenticationError:
+        raise  # wrong user/app password — no point retrying
+    except Exception:
+        # port 465 blocked/slow — retry with STARTTLS on 587
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as s:
+            s.ehlo()
+            s.starttls()
+            s.login(GMAIL_USER, GMAIL_PASS)
+            s.sendmail(GMAIL_USER, [to_email], msg.as_string())
 
 
 def api_send_code(email, device, ip):
@@ -236,7 +247,7 @@ def api_send_code(email, device, ip):
     try:
         _send_gmail(email, code)
     except Exception as e:
-        log_req(ip, "send_code", "", device, "EMAIL_FAIL")
+        log_req(ip, "send_code", str(e)[:60], device, "EMAIL_FAIL")
         return {"status": "EMAIL_FAIL", "message": str(e)[:180]}
     log_req(ip, "send_code", "", device, "CODE_SENT")
     return {"status": "CODE_SENT"}
