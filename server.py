@@ -199,11 +199,36 @@ def api_trial(email, device, ip):
 GMAIL_USER = os.environ.get("GMAIL_USER", "").strip().strip('"').strip("'")
 # App passwords are shown by Google with spaces ("abcd efgh ijkl mnop") — remove them
 GMAIL_PASS = os.environ.get("GMAIL_APP_PASSWORD", "").strip().strip('"').strip("'").replace(" ", "")
+# HTTPS email webhook (Google Apps Script) — needed on Render FREE tier,
+# where ALL outbound SMTP ports (25/465/587) are blocked ([Errno 101]).
+EMAIL_WEBHOOK_URL = os.environ.get("EMAIL_WEBHOOK_URL", "").strip().strip('"').strip("'")
+EMAIL_WEBHOOK_SECRET = os.environ.get("EMAIL_WEBHOOK_SECRET", "mmp-mail-4321").strip()
 TRIAL_DAILY_LIMIT = int(os.environ.get("TRIAL_DAILY_LIMIT", "50"))
 CODE_TTL_MIN = 15
 
 
+def _send_via_webhook(to_email, code):
+    """Send the code via Google Apps Script over HTTPS (port 443 — never blocked)."""
+    body = json.dumps({
+        "secret": EMAIL_WEBHOOK_SECRET,
+        "to": to_email,
+        "subject": "Micro Meta Pro - Verification Code: " + code,
+        "body": ("Your Micro Meta Pro verification code is: " + code +
+                 "\n\nThis code expires in " + str(CODE_TTL_MIN) + " minutes."
+                 "\n\nIf you did not request this, you can ignore this email."),
+    }).encode("utf-8")
+    req = _rq.Request(EMAIL_WEBHOOK_URL, data=body,
+                      headers={"Content-Type": "application/json"}, method="POST")
+    with _rq.urlopen(req, timeout=30) as r:
+        resp = r.read().decode("utf-8", "ignore").strip()
+    if "OK" not in resp:
+        raise RuntimeError("Webhook error: " + resp[:80])
+
+
 def _send_gmail(to_email, code):
+    if EMAIL_WEBHOOK_URL:
+        _send_via_webhook(to_email, code)
+        return
     msg = MIMEText(
         "Your Micro Meta Pro verification code is: " + code +
         "\n\nThis code expires in " + str(CODE_TTL_MIN) + " minutes."
@@ -232,7 +257,7 @@ def api_send_code(email, device, ip):
         return {"status": "INVALID"}
     if not re.match(r"^[a-z0-9][a-z0-9._%+-]*@gmail\.com$", email):
         return {"status": "INVALID_EMAIL"}
-    if not GMAIL_USER or not GMAIL_PASS:
+    if not EMAIL_WEBHOOK_URL and (not GMAIL_USER or not GMAIL_PASS):
         return {"status": "EMAIL_NOT_CONFIGURED"}
     rows = _sb("GET", "trials", "device=eq." + _q(device) + "&select=device")
     if isinstance(rows, list) and rows:
