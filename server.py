@@ -184,7 +184,10 @@ def api_trial(email, device, ip):
         return {"status": "INVALID"}
     rows = _sb("GET", "trials", "device=eq." + _q(device) + "&select=*")
     if isinstance(rows, list) and rows:
-        r = {"status": "ALREADY_REGISTERED"}
+        rec = rows[0] if isinstance(rows[0], dict) else {}
+        r = {"status": "ALREADY_REGISTERED",
+             "email": rec.get("email") or "",
+             "start": rec.get("start") or ""}
     else:
         _sb("POST", "trials", body={"device": device, "email": email,
             "start": date.today().isoformat()}, prefer="return=minimal")
@@ -259,10 +262,13 @@ def api_send_code(email, device, ip):
         return {"status": "INVALID_EMAIL"}
     if not EMAIL_WEBHOOK_URL and (not GMAIL_USER or not GMAIL_PASS):
         return {"status": "EMAIL_NOT_CONFIGURED"}
-    rows = _sb("GET", "trials", "device=eq." + _q(device) + "&select=device")
+    rows = _sb("GET", "trials", "device=eq." + _q(device) + "&select=*")
     if isinstance(rows, list) and rows:
         log_req(ip, "send_code", "", device, "ALREADY_REGISTERED")
-        return {"status": "ALREADY_REGISTERED"}
+        rec = rows[0] if isinstance(rows[0], dict) else {}
+        return {"status": "ALREADY_REGISTERED",
+                "email": rec.get("email") or "",
+                "start": rec.get("start") or ""}
     code = "".join(secrets.choice("0123456789") for _ in range(6))
     _sb("DELETE", "email_codes", "device=eq." + _q(device), prefer="return=minimal")
     _sb("POST", "email_codes", body={
