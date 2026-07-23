@@ -17,7 +17,10 @@
 # ============================================================================
 import json
 import os
+import re
 import secrets
+import smtplib
+from email.mime.text import MIMEText
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib import request as _rq, parse as _up, error as _er
@@ -152,6 +155,30 @@ def api_check(key, device, ip):
             "device": rec.get("device") or ""}
 
 
+def get_notice():
+    rows = _sb("GET", "notice", "select=message&id=eq.1")
+    if isinstance(rows, list) and rows:
+        return str(rows[0].get("message") or "")
+    return ""
+
+
+def api_notice():
+    return {"status": "OK", "message": get_notice()}
+
+
+def get_version():
+    rows = _sb("GET", "appver", "select=version,url&id=eq.1")
+    if isinstance(rows, list) and rows:
+        return (str(rows[0].get("version") or ""),
+                str(rows[0].get("url") or ""))
+    return "", ""
+
+
+def api_version():
+    v, u = get_version()
+    return {"status": "OK", "version": v, "url": u}
+
+
 def api_trial(email, device, ip):
     if not device:
         return {"status": "INVALID"}
@@ -166,6 +193,104 @@ def api_trial(email, device, ip):
     return r
 
 
+
+# -- Gmail verification + trial daily limit ----------------------------------
+
+GMAIL_USER = os.environ.get("GMAIL_USER", "")
+GMAIL_PASS = os.environ.get("GMAIL_APP_PASSWORD", "")
+TRIAL_DAILY_LIMIT = int(os.environ.get("TRIAL_DAILY_LIMIT", "50"))
+CODE_TTL_MIN = 15
+
+
+def _send_gmail(to_email, code):
+    msg = MIMEText(
+        "Your Micro Meta Pro verification code is: " + code +
+        "\n\nThis code expires in " + str(CODE_TTL_MIN) + " minutes."
+        "\n\nIf you did not request this, you can ignore this email.")
+    msg["Subject"] = "Micro Meta Pro - Verification Code: " + code
+    msg["From"] = GMAIL_USER
+    msg["To"] = to_email
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as s:
+        s.login(GMAIL_USER, GMAIL_PASS)
+        s.sendmail(GMAIL_USER, [to_email], msg.as_string())
+
+
+def api_send_code(email, device, ip):
+    email = (email or "").strip().lower()
+    if not device:
+        return {"status": "INVALID"}
+    if not re.match(r"^[a-z0-9][a-z0-9._%+-]*@gmail\.com$", email):
+        return {"status": "INVALID_EMAIL"}
+    if not GMAIL_USER or not GMAIL_PASS:
+        return {"status": "EMAIL_NOT_CONFIGURED"}
+    rows = _sb("GET", "trials", "device=eq." + _q(device) + "&select=device")
+    if isinstance(rows, list) and rows:
+        log_req(ip, "send_code", "", device, "ALREADY_REGISTERED")
+        return {"status": "ALREADY_REGISTERED"}
+    code = "".join(secrets.choice("0123456789") for _ in range(6))
+    _sb("DELETE", "email_codes", "device=eq." + _q(device), prefer="return=minimal")
+    _sb("POST", "email_codes", body={
+        "device": device, "email": email, "code": code,
+        "created": datetime.now().isoformat(timespec="seconds"),
+    }, prefer="return=minimal")
+    try:
+        _send_gmail(email, code)
+    except Exception as e:
+        log_req(ip, "send_code", "", device, "EMAIL_FAIL")
+        return {"status": "EMAIL_FAIL", "message": str(e)[:180]}
+    log_req(ip, "send_code", "", device, "CODE_SENT")
+    return {"status": "CODE_SENT"}
+
+
+def api_verify_code(email, device, code, ip):
+    email = (email or "").strip().lower()
+    code = (code or "").strip()
+    if not device or not code:
+        return {"status": "INVALID"}
+    rows = _sb("GET", "email_codes", "device=eq." + _q(device) + "&select=*")
+    if not (isinstance(rows, list) and rows):
+        return {"status": "NO_CODE"}
+    rec = rows[0]
+    try:
+        created = datetime.fromisoformat(rec.get("created") or "")
+        expired = (datetime.now() - created) > timedelta(minutes=CODE_TTL_MIN)
+    except Exception:
+        expired = True
+    if expired:
+        _sb("DELETE", "email_codes", "device=eq." + _q(device), prefer="return=minimal")
+        log_req(ip, "verify_code", "", device, "EXPIRED_CODE")
+        return {"status": "EXPIRED_CODE"}
+    if (rec.get("email") or "").lower() != email or (rec.get("code") or "") != code:
+        log_req(ip, "verify_code", "", device, "BAD_CODE")
+        return {"status": "BAD_CODE"}
+    _sb("DELETE", "email_codes", "device=eq." + _q(device), prefer="return=minimal")
+    return api_trial(email, device, ip)
+
+
+def api_trial_use(device, ip):
+    if not device:
+        return {"status": "INVALID"}
+    rows = _sb("GET", "trials", "device=eq." + _q(device) + "&select=*")
+    if not (isinstance(rows, list) and rows):
+        return {"status": "NOT_FOUND"}
+    rec = rows[0]
+    today = date.today().isoformat()
+    used = 0
+    if (rec.get("used_date") or "") == today:
+        try:
+            used = int(rec.get("used_count") or 0)
+        except (TypeError, ValueError):
+            used = 0
+    used += 1
+    _sb("PATCH", "trials", "device=eq." + _q(device),
+        body={"used_date": today, "used_count": used}, prefer="return=minimal")
+    if used > TRIAL_DAILY_LIMIT:
+        if used == TRIAL_DAILY_LIMIT + 1:
+            log_req(ip, "trial_use", "", device, "LIMIT")
+        return {"status": "LIMIT", "used": used, "limit": TRIAL_DAILY_LIMIT}
+    return {"status": "OK", "used": used, "limit": TRIAL_DAILY_LIMIT}
+
+
 def handle_api(data, ip):
     action = str(data.get("action", "")).strip().lower()
     key    = str(data.get("key", "")).strip().upper()
@@ -176,6 +301,17 @@ def handle_api(data, ip):
         return api_check(key, device, ip)
     if action == "register_trial":
         return api_trial(str(data.get("email", "")).strip(), device, ip)
+    if action == "send_code":
+        return api_send_code(str(data.get("email", "")).strip(), device, ip)
+    if action == "verify_code":
+        return api_verify_code(str(data.get("email", "")).strip(), device,
+                               str(data.get("code", "")).strip(), ip)
+    if action == "trial_use":
+        return api_trial_use(device, ip)
+    if action == "notice":
+        return api_notice()
+    if action == "version":
+        return api_version()
     if key and device:
         return api_bind(key, device, ip)
     return {"status": "INVALID"}
@@ -237,6 +373,25 @@ def handle_admin(data):
             _sb("PATCH", "licenses", "key=eq." + _q(key),
                 body={"expiry": new_exp, "status": "ACTIVE"}, prefer="return=minimal")
         return {"ok": True}
+
+    if op == "set_notice":
+        msg = str(data.get("message", "")).strip()
+        _sb("PATCH", "notice", "id=eq.1", body={"message": msg,
+            "updated": date.today().isoformat()}, prefer="return=minimal")
+        return {"ok": True}
+
+    if op == "get_notice":
+        return {"ok": True, "message": get_notice()}
+
+    if op == "set_version":
+        _sb("PATCH", "appver", "id=eq.1", body={
+            "version": str(data.get("version", "")).strip(),
+            "url": str(data.get("url", "")).strip()}, prefer="return=minimal")
+        return {"ok": True}
+
+    if op == "get_version":
+        v, u = get_version()
+        return {"ok": True, "version": v, "url": u}
 
     if op == "list":
         rows = _sb("GET", "licenses", "select=*&order=created.desc,key.asc")
@@ -318,6 +473,16 @@ border-radius:8px;padding:10px 18px;margin-right:10px;text-align:center}
 <input id="a_days" type="number" value="30" style="width:70px" title="days (monthly)">
 <button onclick="addLic()">Generate Key</button></div>
 <div id="msg"></div></div>
+<div class="card"><h2>📢 Notice to All Users</h2>
+<div class="row"><input id="n_msg" placeholder="Message shown as popup in every user's app…" size="60">
+<button onclick="setNotice()">Send Notice</button>
+<button class="red" onclick="clearNotice()">Clear</button></div>
+<div id="n_cur" class="sub" style="margin-top:8px"></div></div>
+<div class="card"><h2>🚀 App Update (Auto-Update)</h2>
+<div class="row"><input id="v_ver" placeholder="Latest version e.g. 4.6.0" size="16">
+<input id="v_url" placeholder="Setup.exe direct download URL…" size="50">
+<button onclick="setVer()">Save</button></div>
+<div id="v_cur" class="sub" style="margin-top:8px"></div></div>
 <div class="card"><h2>📜 Licenses <button class="mini gray" onclick="refresh()">↻ Refresh</button></h2>
 <div class="row" style="margin-bottom:8px"><input id="search" placeholder="Search…" oninput="render()" size="30"></div>
 <div class="tablewrap"><table id="tbl"></table></div></div>
@@ -349,7 +514,22 @@ document.getElementById("trials").innerHTML="<tr><th>Device</th><th>Email</th><t
 const g=await api({op:"logs"});
 document.getElementById("logs").innerHTML="<tr><th>Time</th><th>IP</th><th>Action</th><th>Key</th><th>Result</th></tr>"+
 (g.logs||[]).map(x=>`<tr><td>${esc(x.ts)}</td><td>${esc(x.ip)}</td><td>${esc(x.action)}</td><td class="key">${esc(x.key)}</td><td>${esc(x.result)}</td></tr>`).join("");
+loadNotice();
+loadVer();
 }
+async function loadNotice(){const r=await api({op:"get_notice"});
+document.getElementById("n_msg").value=r.message||"";
+document.getElementById("n_cur").textContent=r.message?("📢 Active notice: "+r.message):"No active notice";}
+async function setNotice(){const r=await api({op:"set_notice",message:val("n_msg")});
+if(r.ok){alert("Notice sent to all users ✅");loadNotice();}else alert(r.error||"failed");}
+async function clearNotice(){const r=await api({op:"set_notice",message:""});
+if(r.ok){alert("Notice cleared");loadNotice();}else alert(r.error||"failed");}
+async function loadVer(){const r=await api({op:"get_version"});
+document.getElementById("v_ver").value=r.version||"";
+document.getElementById("v_url").value=r.url||"";
+document.getElementById("v_cur").textContent=r.version?("🚀 Users are told latest version is: "+r.version):"No version set — auto-update off";}
+async function setVer(){const r=await api({op:"set_version",version:val("v_ver"),url:val("v_url")});
+if(r.ok){alert("Version info saved ✅ Users will get the update popup.");loadVer();}else alert(r.error||"failed");}
 function render(){
 const q=(document.getElementById("search").value||"").toLowerCase();
 const rows=LICS.filter(x=>JSON.stringify(x).toLowerCase().includes(q));
