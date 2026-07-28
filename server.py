@@ -167,16 +167,23 @@ def api_notice():
 
 
 def get_version():
-    rows = _sb("GET", "appver", "select=version,url&id=eq.1")
+    rows = _sb("GET", "appver", "select=version,url,notes,sha256,mandatory&id=eq.1")
     if isinstance(rows, list) and rows:
-        return (str(rows[0].get("version") or ""),
-                str(rows[0].get("url") or ""))
-    return "", ""
+        r = rows[0]
+        return {
+            "version": str(r.get("version") or ""),
+            "url": str(r.get("url") or ""),
+            "notes": str(r.get("notes") or ""),
+            "sha256": str(r.get("sha256") or ""),
+            "mandatory": bool(r.get("mandatory")),
+        }
+    return {"version": "", "url": "", "notes": "", "sha256": "", "mandatory": False}
 
 
 def api_version():
-    v, u = get_version()
-    return {"status": "OK", "version": v, "url": u}
+    v = get_version()
+    return {"status": "OK", "version": v["version"], "url": v["url"],
+            "notes": v["notes"], "sha256": v["sha256"], "mandatory": v["mandatory"]}
 
 
 def api_trial(email, device, ip):
@@ -428,12 +435,16 @@ def handle_admin(data):
     if op == "set_version":
         _sb("PATCH", "appver", "id=eq.1", body={
             "version": str(data.get("version", "")).strip(),
-            "url": str(data.get("url", "")).strip()}, prefer="return=minimal")
+            "url": str(data.get("url", "")).strip(),
+            "notes": str(data.get("notes", "")).strip(),
+            "sha256": str(data.get("sha256", "")).strip().lower(),
+            "mandatory": bool(data.get("mandatory", False))}, prefer="return=minimal")
         return {"ok": True}
 
     if op == "get_version":
-        v, u = get_version()
-        return {"ok": True, "version": v, "url": u}
+        v = get_version()
+        return {"ok": True, "version": v["version"], "url": v["url"],
+                "notes": v["notes"], "sha256": v["sha256"], "mandatory": v["mandatory"]}
 
     if op == "list":
         rows = _sb("GET", "licenses", "select=*&order=created.desc,key.asc")
@@ -521,9 +532,12 @@ border-radius:8px;padding:10px 18px;margin-right:10px;text-align:center}
 <button class="red" onclick="clearNotice()">Clear</button></div>
 <div id="n_cur" class="sub" style="margin-top:8px"></div></div>
 <div class="card"><h2>🚀 App Update (Auto-Update)</h2>
-<div class="row"><input id="v_ver" placeholder="Latest version e.g. 4.6.0" size="16">
-<input id="v_url" placeholder="Setup.exe direct download URL…" size="50">
-<button onclick="setVer()">Save</button></div>
+<div class="row"><input id="v_ver" placeholder="Latest version e.g. 4.7.2" size="16">
+<input id="v_url" placeholder="Setup.exe direct download URL…" size="50"></div>
+<div class="row" style="margin-top:8px"><input id="v_sha" placeholder="SHA256 checksum (optional)" size="64"></div>
+<div class="row" style="margin-top:8px"><label style="display:flex;align-items:center;gap:6px;color:#e5e7eb;font-size:13px"><input type="checkbox" id="v_mand" style="width:auto;margin:0"> ⚠️ Mandatory update (users cannot skip)</label></div>
+<textarea id="v_notes" placeholder="Release notes / what's new (optional)…" style="width:100%;min-height:70px;margin-top:8px;background:var(--card2);border:1px solid var(--border);color:#e5e7eb;border-radius:6px;padding:8px 10px;font-size:13px;outline:none;font-family:inherit"></textarea>
+<div class="row" style="margin-top:8px"><button onclick="setVer()">Save</button></div>
 <div id="v_cur" class="sub" style="margin-top:8px"></div></div>
 <div class="card"><h2>📜 Licenses <button class="mini gray" onclick="refresh()">↻ Refresh</button></h2>
 <div class="row" style="margin-bottom:8px"><input id="search" placeholder="Search…" oninput="render()" size="30"></div>
@@ -569,8 +583,11 @@ if(r.ok){alert("Notice cleared");loadNotice();}else alert(r.error||"failed");}
 async function loadVer(){const r=await api({op:"get_version"});
 document.getElementById("v_ver").value=r.version||"";
 document.getElementById("v_url").value=r.url||"";
-document.getElementById("v_cur").textContent=r.version?("🚀 Users are told latest version is: "+r.version):"No version set — auto-update off";}
-async function setVer(){const r=await api({op:"set_version",version:val("v_ver"),url:val("v_url")});
+document.getElementById("v_sha").value=r.sha256||"";
+document.getElementById("v_notes").value=r.notes||"";
+document.getElementById("v_mand").checked=!!r.mandatory;
+document.getElementById("v_cur").textContent=r.version?("🚀 Users are told latest version is: "+r.version+(r.mandatory?" ⚠️ (mandatory)":"")):"No version set — auto-update off";}
+async function setVer(){const r=await api({op:"set_version",version:val("v_ver"),url:val("v_url"),sha256:val("v_sha"),notes:val("v_notes"),mandatory:document.getElementById("v_mand").checked});
 if(r.ok){alert("Version info saved ✅ Users will get the update popup.");loadVer();}else alert(r.error||"failed");}
 function render(){
 const q=(document.getElementById("search").value||"").toLowerCase();
