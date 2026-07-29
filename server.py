@@ -621,6 +621,44 @@ if(tok()){document.getElementById("token").value=tok();refresh();}
 
 # -- HTTP server ------------------------------------------------------------
 
+# -- AI proxy (lets the browser web-app bypass provider CORS) ----------------
+ALLOWED_PROXY_HOSTS = (
+    "api.openai.com",
+    "generativelanguage.googleapis.com",
+    "api.groq.com",
+    "openrouter.ai",
+    "dashscope-intl.aliyuncs.com",
+    "models.inference.ai.azure.com",
+)
+
+
+def api_proxy(data):
+    """Forward an OpenAI-style chat request to the provider using the caller's
+    own API key. Adds no key of its own; only allow-listed hosts are proxied."""
+    base = str(data.get("base", "")).rstrip("/")
+    key = str(data.get("key", "")).strip()
+    body = data.get("body")
+    if not base or not key or not isinstance(body, dict):
+        return 400, {"error": "proxy: base, key and body are required"}
+    host = _up.urlparse(base).netloc.lower()
+    if host not in ALLOWED_PROXY_HOSTS:
+        return 400, {"error": "proxy: host not allowed (%s)" % host}
+    url = base + "/chat/completions"
+    headers = {"Content-Type": "application/json", "Authorization": "Bearer " + key}
+    raw = json.dumps(body).encode("utf-8")
+    req = _rq.Request(url, data=raw, headers=headers, method="POST")
+    try:
+        with _rq.urlopen(req, timeout=120) as r:
+            return r.status, r.read()
+    except _er.HTTPError as e:
+        try:
+            return e.code, e.read()
+        except Exception:
+            return e.code, {"error": "upstream HTTP %s" % e.code}
+    except Exception as e:
+        return 502, {"error": "proxy upstream error: " + str(e)}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "MMPLicense/2.0"
 
@@ -637,11 +675,20 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype + "; charset=utf-8")
         self.send_header("Content-Length", str(len(out)))
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         try:
             self.wfile.write(out)
         except Exception:
             pass
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/") or "/"
@@ -664,6 +711,9 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0].rstrip("/") or "/"
         if path in ("/", "/api", "/exec"):
             self._send(200, handle_api(data, ip))
+        elif path == "/proxy":
+            code, out = api_proxy(data)
+            self._send(code, out)
         elif path == "/admin/api":
             if not secrets.compare_digest(str(data.get("token", "")), str(ADMIN_TOKEN)):
                 self._send(403, {"ok": False, "error": "Invalid admin token"})
